@@ -1,0 +1,64 @@
+name: Health checks
+run-name: Health checks
+on:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_failure:
+        description: Fail check 2 without contacting its destination
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check health
+        env:
+          URL_1: ${{ secrets.URL_1 }}
+          URL_2: ${{ secrets.URL_2 }}
+          TEST_FAILURE: ${{ inputs.test_failure }}
+        shell: bash
+        run: |
+          set +x
+          failed=0
+          body=$(mktemp)
+          trap 'rm -f "$body"' EXIT
+          for number in 1 2; do
+            variable="URL_$number"
+            url=${!variable}
+            if [[ "$number" == 2 && "$TEST_FAILURE" == true ]]; then
+              url='http://127.0.0.1:1'
+            fi
+            if status=$(curl --silent --max-time 10 --retry 2 --retry-all-errors --retry-delay 1 --output "$body" --write-out '%{http_code}' -- "$url" 2>/dev/null) && [[ "$status" == 200 ]] && grep -q '"ok":true' "$body"; then
+              echo "check $number ok"
+            else
+              echo "check $number failed"
+              failed=1
+            fi
+          done
+          exit "$failed"
+  keep-alive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      # shortcut: a monthly empty commit prevents 60-day inactivity; cannot revive an already disabled workflow.
+      - name: Keep schedule active
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          head=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+          commit=$(gh api "repos/$GH_REPO/git/commits/$head")
+          if [[ $(date -u +%Y-%m) != $(jq -r '.committer.date[0:7]' <<< "$commit") ]]; then
+            tree=$(jq -r .tree.sha <<< "$commit")
+            next=$(gh api --method POST "repos/$GH_REPO/git/commits" -f message='chore: keep schedule active' -f tree="$tree" -f "parents[]=$head" --jq .sha)
+            gh api --method PATCH "repos/$GH_REPO/git/refs/heads/main" -f sha="$next" --silent
+          fi
